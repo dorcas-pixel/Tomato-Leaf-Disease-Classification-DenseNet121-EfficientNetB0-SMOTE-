@@ -1,0 +1,224 @@
+import os
+import numpy as np
+import cv2
+from tqdm import tqdm
+import joblib
+import pandas as pd
+
+# Deep learning imports
+import tensorflow as tf
+from tensorflow.keras.applications import DenseNet121, EfficientNetB0
+from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
+from tensorflow.keras.applications.efficientnet import preprocess_input as effnet_preprocess
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D, Input
+from tensorflow.keras.preprocessing.image import img_to_array
+
+# Sklearn / ML imports
+from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_validate
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_fscore_support
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+
+# Configuration - change paths / params here
+DATA_DIR = "path/to/PlantVillage/tomato"   # each class in its own subfolder
+IMAGE_SIZE = (224, 224)
+BATCH_SIZE = 32
+FEATURE_CACHE = "features_cache.npz"
+RANDOM_STATE = 42
+N_SPLITS = 5
+
+# -------------------------
+# Utility: load images & labels from directory
+# -------------------------
+def load_image_paths_and_labels(root_dir):
+    image_paths = []
+    labels = []
+    classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
+    for cls in classes:
+        cls_dir = os.path.join(root_dir, cls)
+        for fname in os.listdir(cls_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                image_paths.append(os.path.join(cls_dir, fname))
+                labels.append(cls)
+    return image_paths, labels, classes
+
+# -------------------------
+# Preprocessing: read, resize, convert to RGB, normalize for ImageNet
+# We'll produce two preprocessed versions (one for each backbone).
+# -------------------------
+def preprocess_for_model(img_bgr, target_size):
+    # Convert BGR -> RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, target_size, interpolation=cv2.INTER_AREA)
+    arr = img_to_array(img_resized)
+    return arr  # raw RGB array (0-255). We'll apply each model's preprocess later.
+
+# -------------------------
+# Build feature extractor models (remove classifier heads)
+# -------------------------
+def build_feature_extractors(input_shape=(224,224,3)):
+    # DenseNet121 trunk
+    input_tensor = Input(shape=input_shape)
+    densenet_base = DenseNet121(weights="imagenet", include_top=False, input_tensor=input_tensor)
+    x1 = GlobalAveragePooling2D()(densenet_base.output)
+    densenet_model = Model(inputs=densenet_base.input, outputs=x1, name="densenet121_gap")
+
+    # EfficientNetB0 trunk
+    input_tensor2 = Input(shape=input_shape)
+    effnet_base = EfficientNetB0(weights="imagenet", include_top=False, input_tensor=input_tensor2)
+    x2 = GlobalAveragePooling2D()(effnet_base.output)
+    effnet_model = Model(inputs=effnet_base.input, outputs=x2, name="efficientnetb0_gap")
+
+    return densenet_model, effnet_model
+
+# -------------------------
+# Extract features in batches and concatenate
+# -------------------------
+def extract_and_cache_features(image_paths, densenet_model, effnet_model, cache_path=FEATURE_CACHE):
+    num = len(image_paths)
+    # We'll create arrays for features by running images through both preprocessors
+    features_concat = []
+    failed = []
+    # Process in batches for memory efficiency
+    for i in tqdm(range(0, num, BATCH_SIZE), desc="Extracting features"):
+        batch_paths = image_paths[i:i+BATCH_SIZE]
+        batch_arr_for_densenet = []
+        batch_arr_for_effnet = []
+        for p in batch_paths:
+            img_bgr = cv2.imread(p)
+            if img_bgr is None:
+                failed.append(p); continue
+            arr = preprocess_for_model(img_bgr, IMAGE_SIZE)
+            # Model-specific preprocessing
+            arr_dn = densenet_preprocess(np.copy(arr))
+            arr_en = effnet_preprocess(np.copy(arr))
+            batch_arr_for_densenet.append(arr_dn)
+            batch_arr_for_effnet.append(arr_en)
+
+        if len(batch_arr_for_densenet) == 0:
+            continue
+
+        batch_dn = np.array(batch_arr_for_densenet, dtype=np.float32)
+        batch_en = np.array(batch_arr_for_effnet, dtype=np.float32)
+
+        # Extract features
+        feats_dn = densenet_model.predict(batch_dn, verbose=0)
+        feats_en = effnet_model.predict(batch_en, verbose=0)
+
+        # Concatenate
+        feats = np.concatenate([feats_dn, feats_en], axis=1)  # shape: (batch, feat_dim)
+        features_concat.append(feats)
+
+    features_concat = np.vstack(features_concat)
+    # Save
+    np.savez_compressed(cache_path, features=features_concat)
+    print(f"Saved feature cache to {cache_path}")
+    return features_concat, failed
+
+# -------------------------
+# Main pipeline
+# -------------------------
+def main():
+    # 1) Load paths and labels
+    image_paths, labels, classes = load_image_paths_and_labels(DATA_DIR)
+    print(f"Found {len(image_paths)} images across {len(classes)} classes: {classes}")
+
+    # 2) Encode labels
+    le = LabelEncoder()
+    y = le.fit_transform(labels)  # integers
+
+    # 3) Build feature extractors
+    densenet_model, effnet_model = build_feature_extractors(input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
+    print("Feature extractor models ready.")
+
+    # 4) Extract or load cached features
+    if os.path.exists(FEATURE_CACHE):
+        print(f"Loading features from cache: {FEATURE_CACHE}")
+        data = np.load(FEATURE_CACHE)
+        X = data["features"]
+    else:
+        X, failed = extract_and_cache_features(image_paths, densenet_model, effnet_model, cache_path=FEATURE_CACHE)
+        if len(failed) > 0:
+            print(f"Warning: {len(failed)} images failed to load and were skipped.")
+
+    print("Feature shape:", X.shape)
+
+    # 5) Optional: scale features before ML
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Persist scaler and label encoder
+    joblib.dump(scaler, "scaler.joblib")
+    joblib.dump(le, "label_encoder.joblib")
+
+    # 6) Define ML classifiers
+    classifiers = {
+        "DecisionTree": DecisionTreeClassifier(random_state=RANDOM_STATE),
+        "SVM": SVC(kernel="rbf", probability=True, random_state=RANDOM_STATE),
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
+        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=RANDOM_STATE)
+    }
+
+    # 7) Cross-validated evaluation (Stratified K-Fold)
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    results = []
+
+    for name, clf in classifiers.items():
+        print(f"\nTraining & evaluating: {name}")
+        accs = []
+        precisions = []
+        recalls = []
+        f1s = []
+
+        fold_idx = 0
+        # manual CV to collect per-fold metrics and optionally save fold models
+        for train_idx, test_idx in skf.split(X_scaled, y):
+            fold_idx += 1
+            X_tr, X_te = X_scaled[train_idx], X_scaled[test_idx]
+            y_tr, y_te = y[train_idx], y[test_idx]
+
+            clf.fit(X_tr, y_tr)
+            y_pred = clf.predict(X_te)
+
+            acc = accuracy_score(y_te, y_pred)
+            p, r, f1, _ = precision_recall_fscore_support(y_te, y_pred, average='weighted', zero_division=0)
+
+            accs.append(acc); precisions.append(p); recalls.append(r); f1s.append(f1)
+
+            print(f" Fold {fold_idx} — Acc: {acc:.4f}  Prec: {p:.4f}  Rec: {r:.4f}  F1: {f1:.4f}")
+
+        print(f"=> {name} mean Acc: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+        print(f"=> {name} mean Precision: {np.mean(precisions):.4f}")
+        print(f"=> {name} mean Recall: {np.mean(recalls):.4f}")
+        print(f"=> {name} mean F1: {np.mean(f1s):.4f}")
+
+        # Fit on full set and save final model
+        clf.fit(X_scaled, y)
+        joblib.dump(clf, f"{name}_clf.joblib")
+        print(f"Saved model: {name}_clf.joblib")
+
+        results.append({
+            "name": name,
+            "acc_mean": float(np.mean(accs)),
+            "acc_std": float(np.std(accs)),
+            "prec_mean": float(np.mean(precisions)),
+            "recall_mean": float(np.mean(recalls)),
+            "f1_mean": float(np.mean(f1s))
+        })
+
+    # 8) Summarize results as DataFrame
+    df_res = pd.DataFrame(results).sort_values("f1_mean", ascending=False)
+    print("\nSummary of classifiers (sorted by F1):")
+    print(df_res.to_string(index=False))
+
+    # Save summary
+    df_res.to_csv("ml_results_summary.csv", index=False)
+    print("Saved summary to ml_results_summary.csv")
+
+if __name__ == "__main__":
+    main()
