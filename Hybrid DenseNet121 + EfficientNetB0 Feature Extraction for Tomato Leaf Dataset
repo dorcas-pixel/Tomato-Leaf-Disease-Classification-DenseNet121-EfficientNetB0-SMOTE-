@@ -1,0 +1,105 @@
+import tensorflow as tf
+import numpy as np
+import os
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+from tensorflow.keras.applications import DenseNet121, EfficientNetB0
+from tensorflow.keras.layers import GlobalAveragePooling2D
+from tensorflow.keras.models import Model
+
+# -----------------------------------------------------------
+# 1. Load PlantVillage Tomato Leaf Dataset
+# -----------------------------------------------------------
+# Folder structure assumed:
+# PlantVillage/
+#     Tomato___Bacterial_spot/
+#     Tomato___Early_blight/
+#     Tomato___Late_blight/
+#     ...
+#     Tomato___healthy/
+
+dataset_path = "PlantVillage/Tomato"
+
+img_size = (224, 224)
+batch_size = 32
+
+train_ds = image_dataset_from_directory(
+    dataset_path,
+    labels="inferred",
+    label_mode="categorical",
+    image_size=img_size,
+    batch_size=batch_size,
+    shuffle=True
+)
+
+class_names = train_ds.class_names
+num_classes = len(class_names)
+print("Classes:", class_names)
+
+# -----------------------------------------------------------
+# 2. Normalization using ImageNet Statistics
+# -----------------------------------------------------------
+def imagenet_preprocess(img, label):
+    img = tf.cast(img, tf.float32) / 255.0
+    
+    mean = tf.constant([0.485, 0.456, 0.406])
+    std  = tf.constant([0.229, 0.224, 0.225])
+    img = (img - mean) / std
+    return img, label
+
+train_ds = train_ds.map(imagenet_preprocess)
+
+# -----------------------------------------------------------
+# 3. Create Hybrid DenseNet121 + EfficientNetB0 Feature Extractor
+# -----------------------------------------------------------
+# DenseNet121 backbone
+base_densenet = DenseNet121(
+    include_top=False,
+    weights='imagenet',
+    input_shape=(224, 224, 3)
+)
+d1 = GlobalAveragePooling2D()(base_densenet.output)
+dense_model = Model(inputs=base_densenet.input, outputs=d1)
+
+# EfficientNetB0 backbone
+base_effnet = EfficientNetB0(
+    include_top=False,
+    weights='imagenet',
+    input_shape=(224, 224, 3)
+)
+e1 = GlobalAveragePooling2D()(base_effnet.output)
+eff_model = Model(inputs=base_effnet.input, outputs=e1)
+
+print("DenseNet121 Feature Dim:", d1.shape)
+print("EfficientNetB0 Feature Dim:", e1.shape)
+
+# -----------------------------------------------------------
+# 4. Extract and Concatenate Features
+# -----------------------------------------------------------
+all_features = []
+all_labels = []
+
+for batch_images, batch_labels in train_ds:
+    # Extract deep features
+    f_dense = dense_model.predict(batch_images, verbose=0)
+    f_eff   = eff_model.predict(batch_images, verbose=0)
+
+    # Concatenate features
+    fused = np.concatenate([f_dense, f_eff], axis=1)
+    
+    all_features.append(fused)
+    all_labels.append(batch_labels.numpy())
+
+# Convert to arrays
+X_features = np.vstack(all_features)
+y_labels   = np.vstack(all_labels)
+
+print("Final Feature Shape:", X_features.shape)
+print("Final Label Shape:", y_labels.shape)
+
+# -----------------------------------------------------------
+# 5. Save feature vectors for ML classifiers
+# -----------------------------------------------------------
+np.save("tomato_features.npy", X_features)
+np.save("tomato_labels.npy", y_labels)
+
+print("Hybrid features saved successfully!")
