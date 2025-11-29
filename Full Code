@@ -1,0 +1,285 @@
+import os
+import numpy as np
+import pandas as pd
+from glob import glob
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Deep learning
+import tensorflow as tf
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.applications import DenseNet121, EfficientNetB0
+from tensorflow.keras.applications.imagenet_utils import preprocess_input as imagenet_preprocess
+from tensorflow.keras.models import Model
+
+# Machine learning
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+# Imbalanced data
+from imblearn.over_sampling import SMOTE
+
+# Statistical tests
+from scipy.stats import friedmanchisquare, wilcoxon
+from statsmodels.stats.contingency_tables import mcnemar
+from statsmodels.stats.multitest import multipletests
+
+# --------------------------
+# User settings (adjust)
+# --------------------------
+DATA_DIR = "path_to_tomato_images"   # folder structure: DATA_DIR/class_name/*.jpg
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+N_SPLITS = 5
+RANDOM_STATE = 42
+EXTRACT_BATCH = 64
+OUTPUT_DIR = "results_srm_classification"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --------------------------
+# Utilities
+# --------------------------
+def load_image_paths_labels(data_dir):
+    """Collect image file paths and labels assuming each subfolder is a class label."""
+    classes = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    paths, labels = [], []
+    for cls in classes:
+        cls_files = glob(os.path.join(data_dir, cls, "*"))
+        for f in cls_files:
+            paths.append(f)
+            labels.append(cls)
+    return np.array(paths), np.array(labels), classes
+
+def batch_extract_features(model, preprocess_fn, paths, img_size=IMG_SIZE, batch_size=EXTRACT_BATCH):
+    """Extract features for a list of image paths using Keras model (model should output pooled features)."""
+    n = len(paths)
+    features = []
+    for i in range(0, n, batch_size):
+        batch_paths = paths[i:i+batch_size]
+        batch_imgs = []
+        for p in batch_paths:
+            img_raw = image.load_img(p, target_size=img_size)
+            x = image.img_to_array(img_raw)
+            x = preprocess_fn(x)  # use imagenet preprocess which works across models
+            batch_imgs.append(x)
+        batch_array = np.stack(batch_imgs, axis=0)
+        feats = model.predict(batch_array, verbose=0)
+        features.append(feats)
+    features = np.vstack(features)
+    return features
+
+def plot_confusion(cm, classes, title, outfile=None):
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.title(title)
+    plt.tight_layout()
+    if outfile:
+        plt.savefig(outfile, dpi=300)
+    plt.show()
+
+# --------------------------
+# Build feature extractors
+# --------------------------
+def build_feature_extractors():
+    # DenseNet121 (no top)
+    base1 = DenseNet121(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+    x1 = tf.keras.layers.GlobalAveragePooling2D()(base1.output)
+    model1 = Model(inputs=base1.input, outputs=x1)
+
+    # EfficientNetB0 (no top)
+    base2 = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+    x2 = tf.keras.layers.GlobalAveragePooling2D()(base2.output)
+    model2 = Model(inputs=base2.input, outputs=x2)
+
+    return model1, model2
+
+# --------------------------
+# Main pipeline
+# --------------------------
+def run_pipeline():
+    print("Loading image paths and labels...")
+    paths, labels_text, classes = load_image_paths_labels(DATA_DIR)
+    n_samples = len(paths)
+    print(f"Found {n_samples} images, {len(classes)} classes: {classes}")
+
+    le = LabelEncoder()
+    labels = le.fit_transform(labels_text)
+
+    # Build extractors once
+    print("Building feature extractor models (DenseNet121 & EfficientNetB0)...")
+    feat_model1, feat_model2 = build_feature_extractors()
+
+    # Precompute all features (if memory allows). If dataset is huge, consider extracting per fold.
+    print("Extracting DenseNet121 features (may take a while)...")
+    feats1 = batch_extract_features(feat_model1, imagenet_preprocess, paths)
+    print("Extracting EfficientNetB0 features (may take a while)...")
+    feats2 = batch_extract_features(feat_model2, imagenet_preprocess, paths)
+
+    # Concatenate DenseNet + EfficientNet features
+    X = np.concatenate([feats1, feats2], axis=1)
+    print("Feature shape:", X.shape)
+
+    # Standardize features (important for SVM)
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+
+    # Prepare cross-validation
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+
+    # Containers to record fold results
+    fold = 0
+    accs = {"SVM": [], "DecisionTree": [], "XGBoost": []}
+    conf_matrices = {"SVM": np.zeros((len(classes), len(classes)), dtype=int),
+                     "DecisionTree": np.zeros((len(classes), len(classes)), dtype=int),
+                     "XGBoost": np.zeros((len(classes), len(classes)), dtype=int)}
+    test_preds_agg = {"SVM": [], "DecisionTree": [], "XGBoost": []}
+    test_trues_agg = []
+
+    for train_idx, test_idx in skf.split(X, labels):
+        fold += 1
+        print(f"\n--- Fold {fold} ---")
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = labels[train_idx], labels[test_idx]
+
+        # Balance training set using SMOTE (on features)
+        sm = SMOTE(random_state=RANDOM_STATE)
+        X_train_res, y_train_res = sm.fit_resample(X_train, y_train)
+        print("After SMOTE, class distribution:", np.bincount(y_train_res))
+
+        # Classifiers with minimal tuning (adjust grid as needed)
+        # 1) SVM (RBF) - use probability=True for ensemble/soft voting if needed
+        svm_clf = SVC(kernel='rbf', probability=True, random_state=RANDOM_STATE)
+        # minimal grid
+        svm_grid = {'C': [1, 5], 'gamma': ['scale', 0.01]}
+        svm_gs = GridSearchCV(svm_clf, svm_grid, cv=3, scoring='accuracy', n_jobs=2)
+        svm_gs.fit(X_train_res, y_train_res)
+        best_svm = svm_gs.best_estimator_
+        print("SVM best params:", svm_gs.best_params_)
+
+        # 2) Decision Tree
+        dt_clf = DecisionTreeClassifier(random_state=RANDOM_STATE)
+        dt_grid = {'max_depth': [None, 10, 20], 'min_samples_split': [2, 5]}
+        dt_gs = GridSearchCV(dt_clf, dt_grid, cv=3, scoring='accuracy', n_jobs=2)
+        dt_gs.fit(X_train_res, y_train_res)
+        best_dt = dt_gs.best_estimator_
+        print("DecisionTree best params:", dt_gs.best_params_)
+
+        # 3) XGBoost
+        xgb_clf = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=RANDOM_STATE)
+        xgb_grid = {'n_estimators': [100, 200], 'max_depth': [3, 6], 'learning_rate': [0.1, 0.01]}
+        xgb_gs = GridSearchCV(xgb_clf, xgb_grid, cv=3, scoring='accuracy', n_jobs=2)
+        xgb_gs.fit(X_train_res, y_train_res)
+        best_xgb = xgb_gs.best_estimator_
+        print("XGBoost best params:", xgb_gs.best_params_)
+
+        # Evaluate on test
+        for name, model in [("SVM", best_svm), ("DecisionTree", best_dt), ("XGBoost", best_xgb)]:
+            y_pred = model.predict(X_test)
+            acc = accuracy_score(y_test, y_pred)
+            accs[name].append(acc)
+            cm = confusion_matrix(y_test, y_pred, labels=range(len(classes)))
+            conf_matrices[name] += cm
+            test_preds_agg[name].extend(y_pred.tolist())
+            print(f"{name} Fold {fold} Accuracy: {acc:.4f}")
+
+        test_trues_agg.extend(y_test.tolist())
+
+    # --------------------------
+    # Summarize results
+    # --------------------------
+    print("\n=== Cross-Validation Summary ===")
+    for name in accs:
+        arr = np.array(accs[name])
+        print(f"{name}: mean acc = {arr.mean():.4f}, std = {arr.std():.4f}, per-fold = {np.round(arr,4)}")
+
+    # Plot aggregated confusion matrices (sum over folds)
+    for name in conf_matrices:
+        outfile = os.path.join(OUTPUT_DIR, f"confusion_{name}.png")
+        plot_confusion(conf_matrices[name], classes=le.classes_, title=f"Aggregated Confusion Matrix - {name}", outfile=outfile)
+
+    # Classification reports on aggregated predictions (macro averaged)
+    for name in test_preds_agg:
+        print(f"\n--- Classification report aggregated for {name} ---")
+        print(classification_report(test_trues_agg, test_preds_agg[name], target_names=le.classes_))
+
+    # --------------------------
+    # Statistical significance tests
+    # --------------------------
+    # 1) Friedman test on accuracies across folds
+    print("\n=== Statistical tests across classifiers (based on per-fold accuracies) ===")
+    acc_matrix = np.vstack([accs["SVM"], accs["DecisionTree"], accs["XGBoost"]])  # shape: (3, n_folds)
+    # Friedman expects samples across repeated measures: provide each classifier's fold accuracies as separate arrays
+    stat, p_friedman = friedmanchisquare(acc_matrix[0], acc_matrix[1], acc_matrix[2])
+    print(f"Friedman chi-square = {stat:.4f}, p = {p_friedman:.4e}")
+    if p_friedman < 0.05:
+        print("Friedman test is significant -> perform pairwise Wilcoxon signed-rank tests (paired folds).")
+    else:
+        print("Friedman test NOT significant -> pairwise differences are not significant at alpha=0.05 (stop here).")
+
+    # 2) Pairwise Wilcoxon (paired by fold), with Holm-Bonferroni correction
+    names = ["SVM", "DecisionTree", "XGBoost"]
+    pvals = []
+    pairs = []
+    for i in range(len(names)):
+        for j in range(i+1, len(names)):
+            a = accs[names[i]]
+            b = accs[names[j]]
+            # Wilcoxon signed-rank (two-sided)
+            try:
+                stat_w, p_w = wilcoxon(a, b)
+            except ValueError:
+                # if all differences zero or not enough variability, fallback to p=1.0
+                p_w = 1.0
+            pvals.append(p_w)
+            pairs.append((names[i], names[j], p_w))
+    # Multiple test correction
+    reject, pvals_corrected, _, _ = multipletests(pvals, alpha=0.05, method='holm')
+    print("\nPairwise Wilcoxon signed-rank test results (Holm-corrected):")
+    for idx, (i,j,p_raw) in enumerate([(p[0], p[1], p[2]) for p in pairs]):
+        print(f"{pairs[idx][0]} vs {pairs[idx][1]}: raw p = {pairs[idx][2]:.4e}, corrected p = {pvals_corrected[idx]:.4e}, reject={reject[idx]}")
+
+    # 3) McNemar's test on aggregated test predictions (pairwise)
+    print("\nMcNemar's test (pairwise on aggregated test predictions):")
+    for i in range(len(names)):
+        for j in range(i+1, len(names)):
+            pred_i = np.array(test_preds_agg[names[i]])
+            pred_j = np.array(test_preds_agg[names[j]])
+            true = np.array(test_trues_agg)
+            # build contingency table for "correct vs incorrect"
+            ci = (pred_i == true)
+            cj = (pred_j == true)
+            # contingency table: [[both correct, i correct only], [j correct only, both incorrect?]] -> but mcnemar expects [[a, b], [c, d]] where b and c are discordant
+            b = np.sum((ci == True) & (cj == False))  # i correct, j incorrect
+            c = np.sum((ci == False) & (cj == True))  # i incorrect, j correct
+            table = [[0, b], [c, 0]]
+            # Perform McNemar (exact if small)
+            try:
+                result = mcnemar(table, exact=True)
+                p_m = result.pvalue
+                stat_m = result.statistic
+            except Exception as e:
+                # fallback to approximate
+                result = mcnemar(table, exact=False)
+                p_m = result.pvalue
+                stat_m = result.statistic
+            print(f"{names[i]} vs {names[j]}: b={b}, c={c}, mcnemar p={p_m:.4e}, stat={stat_m}")
+
+    # Save per-fold accuracies to CSV
+    df_acc = pd.DataFrame({
+        'fold': list(range(1, N_SPLITS+1)),
+        'SVM': accs['SVM'],
+        'DecisionTree': accs['DecisionTree'],
+        'XGBoost': accs['XGBoost']
+    })
+    df_acc.to_csv(os.path.join(OUTPUT_DIR, 'per_fold_accuracies.csv'), index=False)
+    print(f"\nSaved per-fold accuracies to {os.path.join(OUTPUT_DIR, 'per_fold_accuracies.csv')}")
+
+if __name__ == "__main__":
+    run_pipeline()
