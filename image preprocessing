@@ -1,0 +1,44 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Load the image ---
+# Replace 'image.jpg' with your image path
+image = cv2.imread('001187a0-57ab-4329-baff-e7246a9edeb0RS_Early.B 8178.JPG.jpg')
+
+# Convert the image to grayscale
+gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+# --- Step 1: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) ---
+# Create a CLAHE object (clipLimit controls contrast, tileGridSize defines the local region)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+clahe_img = clahe.apply(gray)
+
+# --- Step 2: Apply Bilateral Filtering ---
+# Bilateral filter parameters: (diameter, sigmaColor, sigmaSpace)
+# diameter: neighborhood size; sigmaColor and sigmaSpace control smoothing strength
+bilateral_filtered = cv2.bilateralFilter(clahe_img, d=9, sigmaColor=75, sigmaSpace=75)
+
+# --- Step 3: Display the results ---
+plt.figure(figsize=(12, 6))
+
+plt.subplot(1, 3, 1)
+plt.title('Original Grayscale Image')
+plt.imshow(gray, cmap='gray')
+plt.axis('off')
+
+plt.subplot(1, 3, 2)
+plt.title('After CLAHE')
+plt.imshow(clahe_img, cmap='gray')
+plt.axis('off')
+
+plt.subplot(1, 3, 3)
+plt.title('After CLAHE + Bilateral Filter')
+plt.imshow(bilateral_filtered, cmap='gray')
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# --- Optional: Save the preprocessed image ---
+cv2.imwrite('preprocessed_image.jpg', bilateral_filtered)
