@@ -3,7 +3,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- Load the image ---
-# Replace 'image.jpg' with your image path
 image = cv2.imread('001187a0-57ab-4329-baff-e7246a9edeb0RS_Early.B 8178.JPG.jpg')
 
 # Convert the image to grayscale
